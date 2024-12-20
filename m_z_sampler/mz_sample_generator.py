@@ -8,12 +8,13 @@ from multiprocessing import Pool
 from matplotlib import pyplot as plt
 from scipy.integrate import dblquad
 from scipy.interpolate import interpn
+from scipy.signal import correlate2d
 import corner
 
 os.environ["OMP_NUM_THREADS"] = "1"
 
 true_pars = {}
-with open('true_cosmo_pars.txt', 'r') as f:
+with open('m_z_sampler/true_cosmo_pars.txt', 'r') as f:
     for line in f:
         line = line.split()
         true_pars[line[0]] = float(line[1])
@@ -24,10 +25,13 @@ m_min = 10**12
 lnM_max = np.log(m_max)
 lnM_min = np.log(m_min)
 
-z_min = 0.04
-z_max = 1.3
+z_min = 0.05
+z_max = 0.85
 
-solid_angle = 0.0426464389
+z_piv = 0.35
+lnm_piv = np.log(1.4*10**14)
+
+solid_angle = 13_000 * (np.pi/180)**2
 
 params_true = {
             'flat': True, 'H0': true_pars['h0'], 'Om0': true_pars['omega_m'], 
@@ -35,6 +39,10 @@ params_true = {
             'ns': true_pars['ns'], 'Tcmb0': 2.7255, 'Neff': 3.046
 }
 cosmo_true = cosmology.setCosmology('true_cosmo', **params_true, persistence = '')
+p_lum = [
+    true_pars['a_lum'], true_pars['b_lum'], true_pars['delta_lum'],
+    true_pars['gamma_lum'], true_pars['sigma_lum']
+]
 
 def dn_dmdz(lnm, z, cosmo):
     dv_dz = (
@@ -47,63 +55,66 @@ def dn_dmdz(lnm, z, cosmo):
     )
     return dn_dmdv*dv_dz
 
-z_a = np.linspace(z_min, z_max, 400)
-lnm_a = np.linspace(lnM_min, lnM_max, 400)
 
-def mz_likelihood(X):
-    om, s8, h0, ns, ob = X
-    if (0.1<om<0.5 and 0.6<s8<1.2 and
-        0.92<ns<1 and 0.042<ob<0.049 and 50<h0<90):
-        params = {
-            'flat': True, 'H0': h0, 'Om0': om, 'Ob0': ob, 'sigma8': s8, 
-            'ns': ns, 'Tcmb0': 2.7255, 'Neff': 3.046
-        }
-        cosmo = cosmology.setCosmology('myCosmo', **params, persistence = '')
-        dn_dzdlnm_a = np.empty((len(z_a), len(lnm_a)))
-        for i in range(len(z_a)):
-            dn_dzdlnm_a[i] = dn_dmdz(lnm_a, z_a[i], cosmo)
-        lndn = np.sum(np.log(interpn((z_a, lnm_a), dn_dzdlnm_a, cl_sample)))
-        n = np.trapz(np.trapz(dn_dzdlnm_a, z_a, axis=0), lnm_a)
-        return lndn - n, n
-    else:
-        return -np.inf, None
+def lnm_to_luminosity(lnm, z, p_lum, cosmo):
+    a_lum, b_lum, delta_lum, gamma_lum, _ = p_lum
+    a = a_lum + 43*np.log(10)
+    a += 2*np.log(cosmo.luminosityDistance(z)/cosmo.luminosityDistance(z_piv))
+    a += gamma_lum*np.log((1+z)/(1+z_piv))
+    b = b_lum + delta_lum*np.log((1+z)/(1+z_piv))
     
-ntot = dblquad(dn_dmdz, z_min, z_max, lnM_min, lnM_max, args=(cosmo_true,))[0]
+    return a + b*(lnm - lnm_piv)
 
-print(f'N_tot = {int(ntot)}\n')
+n_cells = 1024
 
-N = 60_000
-maxn = 2
+n_points = n_cells + 1
 
-stop = False
-while not stop:
-    Z = np.linspace(z_min, z_max, N+1)
-    LNM = np.linspace(lnM_min, lnM_max, N+1)
-    dlnm = (LNM[1]-LNM[0])
-    dz = (Z[1]-Z[0])
-    cl_sample = []
-    for i in tqdm.tqdm(range(N-1, -1, -1), desc=f'N = {N}'):
-        mf = dn_dmdz(LNM[:-1]+0.5*dlnm, Z[i]+0.5*dz, cosmo_true)*dlnm*dz
-        mfs = np.random.poisson(mf)
-        maxs = np.max(mfs)
-        if maxs>maxn:
-            print(f'{maxs} = max sample > max_n = {maxn}; N = {N}')
-            N += 10_000
-            break
-        for j in range(len(mfs)):
-            if mfs[j] ==1:
-                cl_sample.append([Z[i]+0.5*dz, LNM[j]+0.5*dlnm])
-            elif mfs[j]==2:
-                lnms = np.random.uniform(LNM[j], LNM[j+1], 2)
-                zs = np.random.uniform(Z[i], Z[i+1], 2)
-                cl_sample.append([zs[0], lnms[0]])
-                cl_sample.append([zs[1], lnms[1]])
-    else:
-        stop=True
+z_a = np.linspace(z_min, z_max, n_points)
+lnm_a = np.linspace(lnM_min, lnM_max, n_points)
+z_grid, lnm_grid = np.meshgrid(z_a, lnm_a, indexing='ij')
+dz = z_a[1] - z_a[0]
+dlnm = lnm_a[1] - lnm_a[0]
 
-cl_sample = np.array(cl_sample)
+dn_dmdz_grid = np.zeros((n_points, n_points))
+for i in range(n_points):
+    dn_dmdz_grid[i] = dn_dmdz(lnm_a, z_a[i], cosmo_true)
+
+kernel = np.ones((2, 2))/4
+dn_grid = correlate2d(dn_dmdz_grid, kernel, mode='valid')*dz*dlnm
+
+z_grid, lnm_grid = np.meshgrid(
+    (z_a[:-1] + z_a[1:])/2, 
+    (lnm_a[:-1] + lnm_a[1:])/2, 
+    indexing='ij'
+)
+
+samples = np.random.poisson(lam=dn_grid)
+
+samples_flat = samples.reshape(-1)
+z_flat = z_grid.reshape(-1)
+lnm_flat = lnm_grid.reshape(-1)
+lnlum_flat = lnm_to_luminosity(lnm_flat, z_flat, p_lum, cosmo_true)
+
+z_list = []
+lnm_list = []
+lnlum_list = []
+
+for i in range(len(samples_flat)):
+    n = int(samples_flat[i])
+    if n!=0:
+        z_list += [z_flat[i]]*n
+        lnm_list += [lnm_flat[i]]*n
+        lnlum_list += [lnlum_flat[i]]*n
+        
+        
+cl_sample = np.column_stack((
+    z_list, 
+    lnm_list, 
+    np.random.normal(lnlum_list, p_lum[-1])
+))
+
 np.save('cl_sample', cl_sample)
-print('\nsample generated!\n')
+
 
 # nwalkers = 64
 # tau = 40

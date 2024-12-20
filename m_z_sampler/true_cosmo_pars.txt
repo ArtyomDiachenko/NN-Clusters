@@ -3,3 +3,8 @@ sigma_8 0.8
 h0 70
 ns 0.95
 ob 0.045
+a_lum 3.36
+b_lum 1.44
+delta_lum 0
+gamma_lum 0
+sigma_lum 0.12
