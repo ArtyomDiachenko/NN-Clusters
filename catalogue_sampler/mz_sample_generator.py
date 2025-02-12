@@ -39,9 +39,14 @@ params_true = {
             'ns': true_pars['ns'], 'Tcmb0': 2.7255, 'Neff': 3.046
 }
 cosmo_true = cosmology.setCosmology('true_cosmo', **params_true, persistence = '')
-p_lum = [
-    true_pars['a_lum'], true_pars['b_lum'], true_pars['delta_lum'],
-    true_pars['gamma_lum'], true_pars['sigma_lum']
+
+p_cr = [
+    true_pars['a_cr'], true_pars['b_cr'], true_pars['delta_cr'],
+    true_pars['gamma_cr'], true_pars['sigma_cr']
+]
+p_l = [
+    true_pars['a_l'], true_pars['b_l'], true_pars['delta_l'],
+    true_pars['gamma_l'], true_pars['sigma_l']
 ]
 
 def dn_dmdz(lnm, z, cosmo):
@@ -55,15 +60,22 @@ def dn_dmdz(lnm, z, cosmo):
     )
     return dn_dmdv*dv_dz
 
-
-def lnm_to_luminosity(lnm, z, p_lum, cosmo):
-    a_lum, b_lum, delta_lum, gamma_lum, _ = p_lum
-    a = a_lum + 43*np.log(10)
-    a += 2*np.log(cosmo.luminosityDistance(z)/cosmo.luminosityDistance(z_piv))
-    a += gamma_lum*np.log((1+z)/(1+z_piv))
-    b = b_lum + delta_lum*np.log((1+z)/(1+z_piv))
-    
+def lnm_to_l(lnm, z, p_l, cosmo):
+    a_l, b_l, delta_l, gamma_l, _ = p_l
+    a = np.log(a_l)
+    a += gamma_l*np.log((1+z)/(1+z_piv))
+    b = b_l + delta_l*np.log((1+z)/(1+z_piv))
     return a + b*(lnm - lnm_piv)
+
+def lnm_to_cr(lnm, z, p_cr, cosmo):
+    a_cr, b_cr, delta_cr, gamma_cr, _ = p_cr
+    a = np.log(a_cr)
+    a += gamma_cr*np.log((1+z)/(1+z_piv))
+    a += 2*np.log(cosmo.Ez(z)/cosmo.Ez(z_piv))
+    a += -2*np.log(cosmo.luminosityDistance(z)/cosmo.luminosityDistance(z_piv))
+    b = b_cr + delta_cr*np.log((1+z)/(1+z_piv))
+    return a + b*(lnm - lnm_piv)
+
 
 n_cells = 1024
 
@@ -93,24 +105,28 @@ samples = np.random.poisson(lam=dn_grid)
 samples_flat = samples.reshape(-1)
 z_flat = z_grid.reshape(-1)
 lnm_flat = lnm_grid.reshape(-1)
-lnlum_flat = lnm_to_luminosity(lnm_flat, z_flat, p_lum, cosmo_true)
+lncr_flat = lnm_to_cr(lnm_flat, z_flat, p_cr, cosmo_true)
+lnl_flat = lnm_to_l(lnm_flat, z_flat, p_l, cosmo_true)
 
 z_list = []
 lnm_list = []
-lnlum_list = []
+lncr_list = []
+lnl_list = []
 
 for i in range(len(samples_flat)):
     n = int(samples_flat[i])
     if n!=0:
         z_list += [z_flat[i]]*n
         lnm_list += [lnm_flat[i]]*n
-        lnlum_list += [lnlum_flat[i]]*n
+        lncr_list += [lncr_flat[i]]*n
+        lnl_list += [lnl_flat[i]]*n
         
         
 cl_sample = np.column_stack((
     z_list, 
     lnm_list, 
-    np.random.normal(lnlum_list, p_lum[-1])
+    np.random.normal(lncr_list, p_cr[-1]),
+    np.random.normal(lnl_list, p_l[-1])
 ))
 
 np.save('cl_sample', cl_sample)
