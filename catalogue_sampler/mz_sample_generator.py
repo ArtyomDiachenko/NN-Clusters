@@ -3,11 +3,21 @@ from colossus.cosmology import cosmology
 from colossus.lss import mass_function
 import os
 from scipy.signal import correlate2d
+import pandas as pd
 
 os.environ["OMP_NUM_THREADS"] = "1"
 
 area_array = np.load("catalogue_sampler/data/effective_area/effective_area.npy")
 zlim_array = np.load("catalogue_sampler/data/effective_area/z_array.npy")
+
+df = pd.read_csv("catalogue_sampler/data/skymap/skykoords.csv")
+df = df[["Texp", "nh", "weight"]]
+
+sky_map_exp = np.array(df["Texp"])
+sky_map_nh = np.array(df["nh"])
+sky_map_weight = np.array(df["weight"])
+
+del df
 
 true_pars = {}
 with open('catalogue_sampler/true_cosmo_pars.txt', 'r') as f:
@@ -126,6 +136,19 @@ cl_sample = np.column_stack((
 ))
 
 cl_sample[:, 3] = np.random.poisson(lam=np.exp(cl_sample[:, 3]))
+
 cl_sample = cl_sample[cl_sample[:, 3]>3]
+cl_sample = cl_sample[cl_sample[:, 2]>-9.2]
+
+idxs = np.random.choice(
+    len(sky_map_weight), size=len(cl_sample), p=sky_map_weight
+)
+
+cl_sample = np.column_stack((
+    cl_sample,
+    sky_map_exp[idxs],
+    sky_map_nh[idxs],
+    sky_map_weight[idxs]
+))
 
 np.save('cl_sample', cl_sample)
