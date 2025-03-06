@@ -4,8 +4,43 @@ from colossus.lss import mass_function
 import os
 from scipy.signal import correlate2d
 import pandas as pd
+from sklearn.preprocessing import MinMaxScaler
+import GPy
+from scipy.stats import truncnorm
+import joblib
+from sklearn.ensemble import RandomForestRegressor
 
 os.environ["OMP_NUM_THREADS"] = "1"
+
+k = GPy.kern.RBF(
+    input_dim=4,
+    variance=1,
+    lengthscale=np.ones(4),
+    ARD=True,
+    name="rbf"
+)
+
+likelihood = GPy.likelihoods.Bernoulli()
+
+m = GPy.core.SVGP(
+    np.array([[1, 1, 1, 1]]),
+    np.array([[1]]),
+    np.random.rand(30, 4),
+    kernel=k, 
+    likelihood=likelihood,
+    batchsize=2**16,
+)
+
+m[:] = np.load("catalogue_sampler/selection_function_fit/model_parameters.npy")
+
+scaler_min, scaler_scale = np.load("catalogue_sampler/selection_function_fit/scaler_parameters.npy")
+scaler = MinMaxScaler()
+scaler.min_ = scaler_min
+scaler.scale_ = scaler_scale
+
+def selection_function(x):
+    x = scaler.transform(x)
+    return m.predict(x)[0]
 
 area_array = np.load("catalogue_sampler/data/effective_area/effective_area.npy")
 zlim_array = np.load("catalogue_sampler/data/effective_area/z_array.npy")
@@ -36,6 +71,13 @@ z_max = 0.85
 
 z_piv = 0.35
 lnm_piv = np.log(1.4*10**14)
+
+cr_min = 0.02
+cr_max = 20
+lambda_min = 3
+lambda_max = 300
+zm_min = 0.1
+zm_max = 0.8
 
 params_true = {
             'flat': True, 'H0': true_pars['h0'], 'Om0': true_pars['omega_m'], 
@@ -80,6 +122,14 @@ def lnm_to_cr(lnm, z, p_cr, cosmo):
     b = b_cr + delta_cr*np.log((1+z)/(1+z_piv))
     return a + b*(lnm - lnm_piv)
 
+
+def cr_error(lncr, z, texp):
+    return np.exp(
+        -0.0756 + 0.385*lncr - 0.429*np.log(texp) - 0.162*np.log(z)
+    )
+    
+
+z_err_model = joblib.load("catalogue_sampler/data/error_model/redshift_error_model.joblib")
 
 n_cells = 1024
 
@@ -135,10 +185,8 @@ cl_sample = np.column_stack((
     np.random.normal(lnl_list, p_l[-1])
 ))
 
-cl_sample[:, 3] = np.random.poisson(lam=np.exp(cl_sample[:, 3]))
-
-cl_sample = cl_sample[cl_sample[:, 3]>3]
-cl_sample = cl_sample[cl_sample[:, 2]>-9.2]
+cl_sample = cl_sample[cl_sample[:, 3]>-3]
+cl_sample = cl_sample[cl_sample[:, 2]>-6.9]
 
 idxs = np.random.choice(
     len(sky_map_weight), size=len(cl_sample), p=sky_map_weight
@@ -150,5 +198,32 @@ cl_sample = np.column_stack((
     sky_map_nh[idxs],
     sky_map_weight[idxs]
 ))
+
+prob = selection_function(np.column_stack((
+    cl_sample[:, 2],
+    np.log(cl_sample[:, 4]),
+    np.log(cl_sample[:, 5]),
+    cl_sample[:, 0]
+)))
+
+prob = np.random.binomial(1, prob)
+cl_sample = cl_sample[prob.reshape(-1)==1]
+cl_sample[:, 3] = truncnorm.rvs(a=0, b=np.inf, loc=np.exp(cl_sample[:, 3]), scale=np.exp(cl_sample[:, 3]))
+cl_sample = cl_sample[cl_sample[:, 3]>lambda_min]
+cl_sample = cl_sample[cl_sample[:, 3]<lambda_max]
+
+cl_sample[:, 2] = np.exp(cl_sample[:, 2]) + np.random.randn(len(cl_sample))*cr_error(cl_sample[:, 2], cl_sample[:, 0], cl_sample[:, 4])
+cl_sample = cl_sample[cl_sample[:, 2]>cr_min]
+cl_sample = cl_sample[cl_sample[:, 2]<cr_max]
+
+cl_sample[:, 0] = cl_sample[:, 0] + np.random.randn(len(cl_sample))*z_err_model.predict(
+    np.column_stack((
+        cl_sample[:, 0],
+        cl_sample[:, 3],
+    ))
+)
+
+cl_sample = cl_sample[cl_sample[:, 0]>zm_min]
+cl_sample = cl_sample[cl_sample[:, 0]<zm_max]
 
 np.save('cl_sample', cl_sample)
