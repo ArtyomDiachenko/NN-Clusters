@@ -4,68 +4,23 @@ from colossus.lss import mass_function
 import os
 from scipy.signal import correlate2d
 import pandas as pd
-from sklearn.preprocessing import MinMaxScaler
-import GPy
 from scipy.stats import truncnorm
-import joblib
-from sklearn.ensemble import RandomForestRegressor
-from math import ceil
+from scipy.special import erf
 from time import time
 
 path = r'C:\Users\Артем\Documents\GitHub\NN-Clusters/'
 
-os.environ["OMP_NUM_THREADS"] = "1"
-
-k = GPy.kern.RBF(
-    input_dim=4,
-    variance=1,
-    lengthscale=np.ones(4),
-    ARD=True,
-    name="rbf"
-)
-
-likelihood = GPy.likelihoods.Bernoulli()
-
-m = GPy.core.SVGP(
-    np.array([[1, 1, 1, 1]]),
-    np.array([[1]]),
-    np.random.rand(30, 4),
-    kernel=k, 
-    likelihood=likelihood,
-    batchsize=2**10,
-)
-
-m[:] = np.load(path+"catalogue_sampler/selection_function_fit/model_parameters.npy")
-
-scaler_min, scaler_scale = np.load(path+"catalogue_sampler/selection_function_fit/scaler_parameters.npy")
-scaler = MinMaxScaler()
-scaler.min_ = scaler_min
-scaler.scale_ = scaler_scale
-
-def selection_function(x, chunksize=2**15):
-    x = scaler.transform(x)
-    if len(x)<chunksize:
-        return m.predict(x)[0].reshape(-1)
-    p = np.zeros(len(x))
-    n_chunks = ceil(len(x)/chunksize)
-    for i in range(n_chunks-1):
-        p[i*chunksize:(i+1)*chunksize] = m.predict(x[i*chunksize:(i+1)*chunksize])[0].reshape(-1)
-    
-    if (i+1)*chunksize<len(x):
-        p[(i+1)*chunksize:] = m.predict(x[(i+1)*chunksize:])[0].reshape(-1)
-    
-    return p
-
-area_array = np.load(path+"catalogue_sampler/data/effective_area/effective_area.npy")
-zlim_array = np.load(path+"catalogue_sampler/data/effective_area/z_array.npy")
-
-df = pd.read_csv(path+"catalogue_sampler/data/skymap/skykoords.csv")
-df = df[["Texp", "nh", "weight"]]
+df = pd.read_csv(path+r"catalogue_sampler\efeds_data\efeds_exp_map.csv")
+df = df[["Texp", "weight"]]
 df = df.astype('float32')
 
 sky_map_exp = np.array(df["Texp"], dtype='float32')
-sky_map_nh = np.array(df["nh"], dtype='float32')
 sky_map_weight = np.array(df["weight"], dtype='float32')
+sky_map_weight /= np.sum(sky_map_weight)
+
+df = pd.read_csv(path+r"catalogue_sampler\efeds_data\lambda_min.csv")
+z_lambda_min_array = df["x"].to_numpy()
+lambda_min_array = df["y"].to_numpy()
 
 del df
 
@@ -76,17 +31,17 @@ lnM_max = np.log(m_max)
 lnM_min = np.log(m_min)
 
 z_min = 0.05
-z_max = 0.85
+z_max = 1.25
 
 z_piv = 0.35
 lnm_piv = np.log(1.4*10**14)
 
 cr_min = 0.02
-cr_max = 20
-lambda_min = 3
+cr_max = 3
+lambda_min = 1
 lambda_max = 300
 zm_min = 0.1
-zm_max = 0.8
+zm_max = 1.2
 
 def dn_dmdz(lnm, z, cosmo):
     dv_dz = (
@@ -116,16 +71,34 @@ def lnm_to_cr(lnm, z, p_cr, cosmo):
     return a + b*(lnm - lnm_piv)
 
 
+def cr_bias(lnm, z, p_bias):
+    a_b, b_b, delta_b, gamma_b = p_bias
+    a = a_b
+    a += gamma_b*np.log(z/z_piv)
+    b = b_b + delta_b*np.log(z/z_piv)
+    return a + b*(lnm - lnm_piv)
+
+
 def cr_error(lncr, z, texp):
     return np.exp(
-        -0.0756 + 0.385*lncr - 0.429*np.log(texp) - 0.162*np.log(z)
+        -0.116 + 0.5789*lncr - 0.393*np.log(texp) - 0.0653*np.log(z)
+    )
+    
+def z_error(z, lambd):
+    return np.exp(
+        -2.412 + 0.5787*np.log(z) - 0.5*np.log(lambd)
     )
     
 
-z_err_model = joblib.load(path+"catalogue_sampler/data/error_model/redshift_error_model.joblib")
+def completeness(cr, z, p_comp, cosmo):
+    cr50, scr, gz = p_comp
+    cr50z = cr50*(
+        cosmo.angularDiameterDistance(z)/
+        cosmo.angularDiameterDistance(z_piv)
+    )**gz
+    return 0.5*(1 + erf((np.log(cr) - np.log(cr50z))/scr))
 
 def generate_sample(pars, n_cells=1024):
-    t1 = time()
     params_true = {
         'flat': True, 'H0': pars['h0'], 'Om0': pars['omega_m'], 
         'Ob0': pars['ob'], 'sigma8': pars['sigma_8'], 
@@ -140,6 +113,14 @@ def generate_sample(pars, n_cells=1024):
     p_l = [
         pars['a_l'], pars['b_l'], pars['delta_l'],
         pars['gamma_l'], pars['sigma_l']
+    ]
+    
+    p_bias = [
+        pars['a_b'], pars['b_b'], pars['delta_b'], pars['gamma_b']
+    ]
+    
+    p_comp = [
+        pars['cr50'], pars['scr'], pars['gz']
     ]
 
     cov = np.array([
@@ -157,11 +138,11 @@ def generate_sample(pars, n_cells=1024):
     dz = z_a[1] - z_a[0]
     dlnm = lnm_a[1] - lnm_a[0]
 
-    effective_area = np.interp(z_a, zlim_array, area_array)*(np.pi/180)**2
+    effective_area = 140*(np.pi/180)**2
 
     dn_dmdz_grid = np.zeros((n_points, n_points))
     for i in range(n_points):
-        dn_dmdz_grid[i] = dn_dmdz(lnm_a, z_a[i], cosmo_true)*effective_area[i]
+        dn_dmdz_grid[i] = dn_dmdz(lnm_a, z_a[i], cosmo_true)*effective_area
 
     kernel = np.ones((2, 2))/4
     dn_grid = correlate2d(dn_dmdz_grid, kernel, mode='valid')*dz*dlnm
@@ -178,6 +159,7 @@ def generate_sample(pars, n_cells=1024):
     z_flat = z_grid.reshape(-1)
     lnm_flat = lnm_grid.reshape(-1)
     lncr_flat = lnm_to_cr(lnm_flat, z_flat, p_cr, cosmo_true)
+    lncr_flat += cr_bias(lnm_flat, z_flat, p_bias)
     lnl_flat = lnm_to_l(lnm_flat, z_flat, p_l, cosmo_true)
 
     z_list = []
@@ -200,9 +182,6 @@ def generate_sample(pars, n_cells=1024):
         )
     ))
     
-    # if np.sum(cl_sample[:, 1]>np.log(10))>=1000:
-    #     return np.array([])
-    
     del z_list, lnm_list, lncr_list, lnl_list, z_flat, lnm_flat, lncr_flat, lnl_flat
     
     cl_sample = cl_sample.astype('float32')
@@ -214,49 +193,36 @@ def generate_sample(pars, n_cells=1024):
         len(sky_map_weight), size=len(cl_sample), p=sky_map_weight
     )
     
-
-    prob = selection_function(np.column_stack((
-        cl_sample[:, 1],
-        np.log(sky_map_exp[idxs]),
-        np.log(sky_map_nh[idxs]),
-        cl_sample[:, 0]
-    )))
+    cl_sample[:, 1] = np.exp(cl_sample[:, 1]) + np.random.randn(len(cl_sample))*cr_error(
+        cl_sample[:, 1], cl_sample[:, 0], sky_map_exp[idxs]
+    )
     
-
+    cl_sample = cl_sample[cl_sample[:, 1] > 0]
+    
+    prob = completeness(
+        cl_sample[:, 1], cl_sample[:, 0], p_comp, cosmo_true
+    )
+    
     prob = np.random.binomial(1, prob)
-    cl_sample = np.column_stack((
-        cl_sample,
-        sky_map_exp[idxs]
-    ))
-
+    
     cl_sample = cl_sample[prob==1]
     
-    cl_sample[:, 2] = np.exp(cl_sample[:, 2]) 
+    cl_sample[:, 2] = np.exp(cl_sample[:, 2])
     cl_sample[:, 2] = truncnorm.rvs(
-        a=-np.sqrt(cl_sample[:, 2]), b=np.inf, 
-        loc=cl_sample[:, 2], scale=np.sqrt(cl_sample[:, 2])
+        a=-np.sqrt(cl_sample[:, 2])/1.1, b=np.inf, 
+        loc=cl_sample[:, 2], scale=np.sqrt(cl_sample[:, 2])*1.1
     )
-    cl_sample = cl_sample[cl_sample[:, 2]>lambda_min]
-    cl_sample = cl_sample[cl_sample[:, 2]<lambda_max]
+    cl_sample[:, 0] = cl_sample[:, 0] + np.random.randn(len(cl_sample))*z_error(cl_sample[:, 0], cl_sample[:, 2])
+    
+    cl_sample = cl_sample[cl_sample[:, 0]>zm_min]
+    cl_sample = cl_sample[cl_sample[:, 0]<zm_max]
+    
+    cl_sample = cl_sample[cl_sample[:, 2]>np.interp(cl_sample[:, 0], z_lambda_min_array, lambda_min_array)]    
 
-    cl_sample[:, 1] = (
-        np.exp(cl_sample[:, 1]) + 
-        np.random.randn(len(cl_sample))*cr_error(cl_sample[:, 1], cl_sample[:, 0], cl_sample[:, 3])
-    )
     cl_sample = cl_sample[cl_sample[:, 1]>cr_min]
     cl_sample = cl_sample[cl_sample[:, 1]<cr_max]
     
     if len(cl_sample)==0:
         return np.array([])
-
-    cl_sample[:, 0] = cl_sample[:, 0] + np.random.randn(len(cl_sample))*z_err_model.predict(
-        np.column_stack((
-            cl_sample[:, 0],
-            cl_sample[:, 2],
-        ))
-    )
-
-    cl_sample = cl_sample[cl_sample[:, 0]>zm_min]
-    cl_sample = cl_sample[cl_sample[:, 0]<zm_max]
-
+    
     return cl_sample
